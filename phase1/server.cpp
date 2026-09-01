@@ -11,6 +11,7 @@
 #include <string>
 #include <map>
 #include <mutex>
+#include <sstream>
 
 
 std::map<std::string, int> clients;
@@ -28,6 +29,94 @@ std::string get_username_by_socket(int sock) {
     return "";
 }
 
+bool send_all(int sock, const std::string& data) {
+    size_t total_sent = 0;
+
+    while (total_sent < data.size()) {
+        ssize_t sent = send(
+            sock,
+            data.data() + total_sent,
+            data.size() - total_sent,
+            0
+        );
+
+        if (sent <= 0) {
+            return false;
+        }
+
+        total_sent += static_cast<size_t>(sent);
+    }
+
+    return true;
+}
+
+void send_line(int sock, const std::string& message) {
+    send_all(sock, message + "\n");
+}
+
+void handle_who(int sock) {
+    std::ostringstream response;
+    response << "USERS";
+
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+
+        for (const auto& pair : clients) {
+            response << " " << pair.first;
+        }
+    }
+
+    send_line(sock, response.str());
+}
+
+void handle_message(
+    int sender_sock,
+    const std::string& recipient,
+    const std::string& message
+) {
+    std::string sender = get_username_by_socket(sender_sock);
+
+    if (sender.empty()) {
+        send_line(sender_sock, "ERR You are not logged in");
+        return;
+    }
+
+    int recipient_sock = -1;
+
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+
+        auto it = clients.find(recipient);
+
+        if (it != clients.end()) {
+            recipient_sock = it->second;
+        }
+    }
+
+    if (recipient_sock == -1) {
+        send_line(
+            sender_sock,
+            "ERR User '" + recipient + "' is not online"
+        );
+        return;
+    }
+
+    // IMPORTANT: Phase 1 verification requirement.
+    // The server can read the complete plaintext message.
+    std::cout << "[RELAY PLAINTEXT] "
+              << sender << " -> "
+              << recipient << ": "
+              << message
+              << std::endl;
+
+    send_line(
+        recipient_sock,
+        "FROM " + sender + " " + message
+    );
+
+    send_line(sender_sock, "OK Message delivered");
+}
+
 bool process_command(
     int sock,
     const std::string& line,
@@ -35,12 +124,14 @@ bool process_command(
 ) {
     if (starts_with(line, "LOGIN ")) {
         if (!username.empty()) {
+            send_line(sock, "ERR Already logged in");
             return true;
         }
 
         std::string requested_name = line.substr(6);
 
         if (requested_name.empty()) {
+            send_line(sock, "ERR Username cannot be empty");
             return true;
         }
 
@@ -48,6 +139,7 @@ bool process_command(
             std::lock_guard<std::mutex> lock(clients_mutex);
 
             if (clients.count(requested_name)) {
+                send_line(sock, "ERR Username already in use");
                 return true;
             }
 
@@ -59,10 +151,50 @@ bool process_command(
         std::cout << "[SERVER] User connected: "
                   << username << std::endl;
 
+        send_line(sock, "OK Logged in as " + username);
 
         return true;
     }
-    return false;
+
+    if (username.empty()) {
+        send_line(sock, "ERR Please LOGIN first");
+        return true;
+    }
+
+    if (line == "WHO") {
+        handle_who(sock);
+        return true;
+    }
+
+    if (starts_with(line, "MSG ")) {
+        std::string rest = line.substr(4);
+
+        size_t space = rest.find(' ');
+
+        if (space == std::string::npos) {
+            send_line(
+                sock,
+                "ERR Usage: MSG <username> <message>"
+            );
+            return true;
+        }
+
+        std::string recipient = rest.substr(0, space);
+        std::string message = rest.substr(space + 1);
+
+        if (message.empty()) {
+            send_line(sock, "ERR Message cannot be empty");
+            return true;
+        }
+
+        handle_message(sock, recipient, message);
+
+        return true;
+    }
+
+    send_line(sock, "ERR Unknown command");
+
+    return true;
 }
 
 void handle_client(int client_sock) {
