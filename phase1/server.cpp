@@ -12,10 +12,14 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <memory>
 
 
 std::map<std::string, int> clients;
 std::mutex clients_mutex;
+
+// one write-mutex per connected socket, to serialize all writes to that fd
+std::map<int, std::shared_ptr<std::mutex>> client_write_mutexes;
 
 std::string get_username_by_socket(int sock) {
     std::lock_guard<std::mutex> lock(clients_mutex);
@@ -54,20 +58,51 @@ void send_line(int sock, const std::string& message) {
     send_all(sock, message + "\n");
 }
 
-void remove_client(int sock) {
+std::shared_ptr<std::mutex> get_write_mutex(int sock) {
     std::lock_guard<std::mutex> lock(clients_mutex);
+    auto it = client_write_mutexes.find(sock);
+    return (it != client_write_mutexes.end()) ? it->second : nullptr;
+}
 
-    for (auto it = clients.begin(); it != clients.end(); ++it) {
-        if (it->second == sock) {
-            std::cout << "[SERVER] User disconnected: "
-                      << it->first << std::endl;
+void send_line_safe(int sock, const std::string& message) {
+    auto mtx = get_write_mutex(sock);
+    if (mtx) {
+        std::lock_guard<std::mutex> lock(*mtx);
+        send_line(sock, message);
+    } else {
+        // Not yet registered (e.g. pre-LOGIN) — no contention possible yet
+        send_line(sock, message);
+    }
+}
 
-            clients.erase(it);
-            break;
+void remove_client(int sock) {
+    std::shared_ptr<std::mutex> write_mtx;
+
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+
+        for (auto it = clients.begin(); it != clients.end(); ++it) {
+            if (it->second == sock) {
+                std::cout << "[SERVER] User disconnected: "
+                          << it->first << std::endl;
+                clients.erase(it);
+                break;
+            }
+        }
+
+        auto it2 = client_write_mutexes.find(sock);
+        if (it2 != client_write_mutexes.end()) {
+            write_mtx = it2->second;
+            client_write_mutexes.erase(it2);
         }
     }
 
-    close(sock);
+    if (write_mtx) {
+        std::lock_guard<std::mutex> lock(*write_mtx);
+        close(sock);
+    } else {
+        close(sock);
+    }
 }
 
 void handle_who(int sock) {
@@ -82,7 +117,7 @@ void handle_who(int sock) {
         }
     }
 
-    send_line(sock, response.str());
+    send_line_safe(sock, response.str());
 }
 
 void handle_message(
@@ -93,7 +128,7 @@ void handle_message(
     std::string sender = get_username_by_socket(sender_sock);
 
     if (sender.empty()) {
-        send_line(sender_sock, "ERR You are not logged in");
+        send_line_safe(sender_sock, "ERR You are not logged in");
         return;
     }
 
@@ -110,7 +145,7 @@ void handle_message(
     }
 
     if (recipient_sock == -1) {
-        send_line(
+        send_line_safe(
             sender_sock,
             "ERR User '" + recipient + "' is not online"
         );
@@ -125,12 +160,12 @@ void handle_message(
               << message
               << std::endl;
 
-    send_line(
+    send_line_safe(
         recipient_sock,
         "FROM " + sender + " " + message
     );
 
-    send_line(sender_sock, "OK Message delivered");
+    send_line_safe(sender_sock, "OK Message delivered");
 }
 
 bool process_command(
@@ -140,14 +175,14 @@ bool process_command(
 ) {
     if (starts_with(line, "LOGIN ")) {
         if (!username.empty()) {
-            send_line(sock, "ERR Already logged in");
+            send_line_safe(sock, "ERR Already logged in");
             return true;
         }
 
         std::string requested_name = line.substr(6);
 
         if (requested_name.empty()) {
-            send_line(sock, "ERR Username cannot be empty");
+            send_line_safe(sock, "ERR Username cannot be empty");
             return true;
         }
 
@@ -155,11 +190,13 @@ bool process_command(
             std::lock_guard<std::mutex> lock(clients_mutex);
 
             if (clients.count(requested_name)) {
-                send_line(sock, "ERR Username already in use");
+                send_line_safe(sock, "ERR Username already in use");
                 return true;
             }
 
             clients[requested_name] = sock;
+        
+            client_write_mutexes[sock] = std::make_shared<std::mutex>(); 
         }
 
         username = requested_name;
@@ -167,13 +204,13 @@ bool process_command(
         std::cout << "[SERVER] User connected: "
                   << username << std::endl;
 
-        send_line(sock, "OK Logged in as " + username);
+        send_line_safe(sock, "OK Logged in as " + username);
 
         return true;
     }
 
     if (username.empty()) {
-        send_line(sock, "ERR Please LOGIN first");
+        send_line_safe(sock, "ERR Please LOGIN first");
         return true;
     }
 
@@ -188,7 +225,7 @@ bool process_command(
         size_t space = rest.find(' ');
 
         if (space == std::string::npos) {
-            send_line(
+            send_line_safe(
                 sock,
                 "ERR Usage: MSG <username> <message>"
             );
@@ -199,7 +236,7 @@ bool process_command(
         std::string message = rest.substr(space + 1);
 
         if (message.empty()) {
-            send_line(sock, "ERR Message cannot be empty");
+            send_line_safe(sock, "ERR Message cannot be empty");
             return true;
         }
 
@@ -209,11 +246,11 @@ bool process_command(
     }
 
     if (line == "QUIT") {
-        send_line(sock, "OK Goodbye");
+        send_line_safe(sock, "OK Goodbye");
         return false;
     }
 
-    send_line(sock, "ERR Unknown command");
+    send_line_safe(sock, "ERR Unknown command");
 
     return true;
 }
