@@ -6,9 +6,106 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <cstring>
 #include <iostream>
+#include <thread>
+#include <string>
+#include <map>
+#include <mutex>
 
+
+std::map<std::string, int> clients;
+std::mutex clients_mutex;
+
+std::string get_username_by_socket(int sock) {
+    std::lock_guard<std::mutex> lock(clients_mutex);
+
+    for (const auto& pair : clients) {
+        if (pair.second == sock) {
+            return pair.first;
+        }
+    }
+
+    return "";
+}
+
+bool process_command(
+    int sock,
+    const std::string& line,
+    std::string& username
+) {
+    if (starts_with(line, "LOGIN ")) {
+        if (!username.empty()) {
+            return true;
+        }
+
+        std::string requested_name = line.substr(6);
+
+        if (requested_name.empty()) {
+            return true;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+
+            if (clients.count(requested_name)) {
+                return true;
+            }
+
+            clients[requested_name] = sock;
+        }
+
+        username = requested_name;
+
+        std::cout << "[SERVER] User connected: "
+                  << username << std::endl;
+
+
+        return true;
+    }
+    return false;
+}
+
+void handle_client(int client_sock) {
+    std::string username;
+    std::string pending_data;
+
+    char buffer[BUFFER_SIZE];
+
+    while (true) {
+        ssize_t bytes_received = recv(
+            client_sock,
+            buffer,
+            sizeof(buffer),
+            0
+        );
+
+        if (bytes_received <= 0) {
+            break;
+        }
+
+        pending_data.append(buffer, bytes_received);
+
+        while (true) {
+            size_t newline = pending_data.find('\n');
+
+            if (newline == std::string::npos) {
+                break;
+            }
+
+            std::string line =
+                pending_data.substr(0, newline);
+
+            pending_data.erase(0, newline + 1);
+
+            process_command(
+                client_sock,
+                line,
+                username
+            );
+        }
+    }
+
+}
 
 int main(int argc, char* argv[]) {
     int port = CHAT_PORT;
@@ -82,6 +179,10 @@ int main(int argc, char* argv[]) {
                   << inet_ntoa(client_addr.sin_addr)
                   << std::endl;
 
+        std::thread(
+            handle_client,
+            client_sock
+        ).detach();
     }
 
     close(server_sock);
