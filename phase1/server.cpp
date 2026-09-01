@@ -54,6 +54,22 @@ void send_line(int sock, const std::string& message) {
     send_all(sock, message + "\n");
 }
 
+void remove_client(int sock) {
+    std::lock_guard<std::mutex> lock(clients_mutex);
+
+    for (auto it = clients.begin(); it != clients.end(); ++it) {
+        if (it->second == sock) {
+            std::cout << "[SERVER] User disconnected: "
+                      << it->first << std::endl;
+
+            clients.erase(it);
+            break;
+        }
+    }
+
+    close(sock);
+}
+
 void handle_who(int sock) {
     std::ostringstream response;
     response << "USERS";
@@ -192,6 +208,11 @@ bool process_command(
         return true;
     }
 
+    if (line == "QUIT") {
+        send_line(sock, "OK Goodbye");
+        return false;
+    }
+
     send_line(sock, "ERR Unknown command");
 
     return true;
@@ -229,14 +250,18 @@ void handle_client(int client_sock) {
 
             pending_data.erase(0, newline + 1);
 
-            process_command(
-                client_sock,
-                line,
-                username
-            );
+            if (!process_command(
+                    client_sock,
+                    line,
+                    username
+                )) {
+                remove_client(client_sock);
+                return;
+            }
         }
     }
 
+    remove_client(client_sock);
 }
 
 int main(int argc, char* argv[]) {
