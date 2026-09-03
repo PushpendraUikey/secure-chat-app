@@ -1,6 +1,8 @@
 #include "protocol.h"
 #include "dh.h"
 #include "crypto_utils.h"
+#include "aes_gcm.h"
+#include "base64.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -16,22 +18,11 @@
 
 bool send_all(int sock, const std::string& data) {
     size_t total_sent = 0;
-
     while (total_sent < data.size()) {
-        ssize_t sent = send(
-            sock,
-            data.data() + total_sent,
-            data.size() - total_sent,
-            0
-        );
-
-        if (sent <= 0) {
-            return false;
-        }
-
+        ssize_t sent = send(sock, data.data() + total_sent, data.size() - total_sent, 0);
+        if (sent <= 0) return false;
         total_sent += static_cast<size_t>(sent);
     }
-
     return true;
 }
 
@@ -39,26 +30,24 @@ bool send_line(int sock, const std::string& message) {
     return send_all(sock, message + "\n");
 }
 
+bool send_secure_line(int sock, const std::array<unsigned char, AES_KEY_SIZE>& key, const std::string& message) {
+    std::string blob = encrypt_message(key, message);
+    std::string b64 = base64_encode(blob);
+    return send_line(sock, b64);
+}
+
 void receive_messages(
     int sock,
+    const std::array<unsigned char, AES_KEY_SIZE>& key,
     std::atomic<bool>& running
 ) {
     std::string pending_data;
-
     char buffer[BUFFER_SIZE];
 
     while (running) {
-        ssize_t bytes_received = recv(
-            sock,
-            buffer,
-            sizeof(buffer),
-            0
-        );
-
+        ssize_t bytes_received = recv(sock, buffer, sizeof(buffer), 0);
         if (bytes_received <= 0) {
-            std::cout
-                << "\n[Disconnected from server]\n";
-
+            std::cout << "\n[Disconnected from server]\n";
             running = false;
             break;
         }
@@ -67,73 +56,51 @@ void receive_messages(
 
         while (true) {
             size_t newline = pending_data.find('\n');
+            if (newline == std::string::npos) break;
 
-            if (newline == std::string::npos) {
+            std::string raw_line = pending_data.substr(0, newline);
+            pending_data.erase(0, newline + 1);
+
+            std::string line;
+            try {
+                line = decrypt_message(key, base64_decode(raw_line));
+            } catch (const std::exception& e) {
+                std::cout << "\n[CRYPTO ERROR] Tampering detected: " << e.what() << "\n> " << std::flush;
+                running = false;
                 break;
             }
 
-            std::string line =
-                pending_data.substr(0, newline);
-
-            pending_data.erase(0, newline + 1);
-
             if (starts_with(line, "FROM ")) {
                 std::string rest = line.substr(5);
-
                 size_t space = rest.find(' ');
-
                 if (space != std::string::npos) {
-                    std::string sender =
-                        rest.substr(0, space);
-
-                    std::string message =
-                        rest.substr(space + 1);
-
-                    std::cout
-                        << "\n[" << sender << "] "
-                        << message << "\n> "
-                        << std::flush;
+                    std::cout << "\n[" << rest.substr(0, space) << "] "
+                              << rest.substr(space + 1) << "\n> " << std::flush;
                 }
             }
             else if (starts_with(line, "USERS")) {
-                std::cout
-                    << "\nOnline users: "
-                    << line.substr(5)
-                    << "\n> "
-                    << std::flush;
+                std::cout << "\nOnline users: " << line.substr(5) << "\n> " << std::flush;
             }
             else if (starts_with(line, "ERR ")) {
-                std::cout
-                    << "\n[ERROR] "
-                    << line.substr(4)
-                    << "\n> "
-                    << std::flush;
+                std::cout << "\n[ERROR] " << line.substr(4) << "\n> " << std::flush;
             }
             else if (starts_with(line, "OK ")) {
-                std::cout
-                    << "\n[SERVER] "
-                    << line.substr(3)
-                    << "\n> "
-                    << std::flush;
+                std::cout << "\n[SERVER] " << line.substr(3) << "\n> " << std::flush;
             }
             else {
-                std::cout
-                    << "\n[SERVER] "
-                    << line
-                    << "\n> "
-                    << std::flush;
+                std::cout << "\n[SERVER] " << line << "\n> " << std::flush;
             }
         }
     }
 }
 
 void print_help() {
-    std::cout << "\nCommands:\n";
-    std::cout << "  @username message  Send message and select user\n";
-    std::cout << "  /chat username     Select chat partner\n";
-    std::cout << "  /who               Show online users\n";
-    std::cout << "  /quit              Disconnect and exit\n";
-    std::cout << "\nAny other text is sent to the selected user.\n\n";
+    std::cout << "\nCommands:\n"
+              << "  @username message  Send message and select user\n"
+              << "  /chat username     Select chat partner\n"
+              << "  /who               Show online users\n"
+              << "  /quit              Disconnect and exit\n"
+              << "\nAny other text is sent to the selected user.\n\n";
 }
 
 bool perform_dh_handshake(int sock, std::array<unsigned char, AES_KEY_SIZE>& session_key) {
@@ -160,22 +127,18 @@ bool perform_dh_handshake(int sock, std::array<unsigned char, AES_KEY_SIZE>& ses
                 std::string shared_secret = dh.compute_shared_secret(server_pub);
                 session_key = derive_key(shared_secret);
                 
-                std::cout << "[*] Secure session established.\n";
-                std::cout << "[*] Key Fingerprint: " << fingerprint(shared_secret) << "\n";
+                std::cout << "[*] Secure session established.\n"
+                          << "[*] Key Fingerprint: " << fingerprint(shared_secret) << "\n";
                 return true;
             }
-            return false; // Unexpected response
+            return false;
         }
     }
 }
 
 int main(int argc, char* argv[]) {
     if (argc != 4) {
-        std::cerr
-            << "Usage: "
-            << argv[0]
-            << " <server_ip> <port> <username>\n";
-
+        std::cerr << "Usage: " << argv[0] << " <server_ip> <port> <username>\n";
         return 1;
     }
 
@@ -184,34 +147,22 @@ int main(int argc, char* argv[]) {
     std::string username = argv[3];
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-
     if (sock < 0) {
         perror("socket");
         return 1;
     }
 
     sockaddr_in server_addr{};
-
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
 
-    if (inet_pton(
-            AF_INET,
-            server_ip.c_str(),
-            &server_addr.sin_addr
-        ) <= 0) {
-
+    if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) <= 0) {
         std::cerr << "Invalid server IP\n";
         close(sock);
         return 1;
     }
 
-    if (connect(
-            sock,
-            reinterpret_cast<sockaddr*>(&server_addr),
-            sizeof(server_addr)
-        ) < 0) {
-
+    if (connect(sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
         perror("connect");
         close(sock);
         return 1;
@@ -224,125 +175,72 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!send_line(sock, "LOGIN " + username)) {
+    if (!send_secure_line(sock, session_key, "LOGIN " + username)) {
         std::cerr << "Could not send login\n";
         close(sock);
         return 1;
     }
 
     std::atomic<bool> running(true);
-
-    std::thread receiver(
-        receive_messages,
-        sock,
-        std::ref(running)
-    );
+    std::thread receiver(receive_messages, sock, std::ref(session_key), std::ref(running));
 
     std::string selected_user;
-
-    std::cout
-        << "Connected as: "
-        << username
-        << std::endl;
-
+    std::cout << "Connected as: " << username << std::endl;
     print_help();
 
     while (running) {
         std::cout << "> ";
-
         std::string input;
-
-        if (!std::getline(std::cin, input)) {
-            break;
-        }
-
-        if (input.empty()) {
-            continue;
-        }
+        if (!std::getline(std::cin, input)) break;
+        if (input.empty()) continue;
 
         if (input == "/who") {
-            send_line(sock, "WHO");
+            send_secure_line(sock, session_key, "WHO");
         }
-
         else if (input == "/quit") {
-            send_line(sock, "QUIT");
+            send_secure_line(sock, session_key, "QUIT");
             running = false;
             break;
         }
-
         else if (starts_with(input, "/chat ")) {
             std::string target = input.substr(6);
-
             if (target.empty()) {
-                std::cout
-                    << "Usage: /chat username\n";
-
+                std::cout << "Usage: /chat username\n";
                 continue;
             }
-
             selected_user = target;
-
-            std::cout
-                << "Now chatting with: "
-                << selected_user
-                << std::endl;
+            std::cout << "Now chatting with: " << selected_user << std::endl;
         }
-
         else if (input[0] == '@') {
             size_t space = input.find(' ');
-
             if (space == std::string::npos) {
-                std::cout
-                    << "Usage: @username message\n";
-
+                std::cout << "Usage: @username message\n";
                 continue;
             }
-
-            std::string target =
-                input.substr(1, space - 1);
-
-            std::string message =
-                input.substr(space + 1);
+            std::string target = input.substr(1, space - 1);
+            std::string message = input.substr(space + 1);
 
             if (target.empty() || message.empty()) {
-                std::cout
-                    << "Usage: @username message\n";
-
+                std::cout << "Usage: @username message\n";
                 continue;
             }
-
             selected_user = target;
-
-            send_line(
-                sock,
-                "MSG " + selected_user + " " + message
-            );
+            send_secure_line(sock, session_key, "MSG " + selected_user + " " + message);
         }
-
         else {
             if (selected_user.empty()) {
-                std::cout
-                    << "No chat partner selected.\n"
-                    << "Use /chat username or "
-                    << "@username message\n";
-
+                std::cout << "No chat partner selected.\n"
+                          << "Use /chat username or @username message\n";
                 continue;
             }
-
-            send_line(
-                sock,
-                "MSG " + selected_user + " " + input
-            );
+            send_secure_line(sock, session_key, "MSG " + selected_user + " " + input);
         }
     }
 
     shutdown(sock, SHUT_RDWR);
-
     close(sock);
-
     if (receiver.joinable()) {
         receiver.join();
     }
-
     return 0;
 }
