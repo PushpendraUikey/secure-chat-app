@@ -264,7 +264,9 @@ void handle_client(int client_sock) {
                 line = decrypt_message(session_key, base64_decode(raw_line));
             } catch (const std::exception& e) {
                 std::cerr << "[SERVER] Crypto error on socket " << client_sock << ": " << e.what() << "\n";
-                break;
+                send_secure_line_safe(client_sock, "ERR Message authentication failed - connection terminated");
+                remove_client(client_sock);
+                return; // Terminate this connection entirely
             }
 
             if (!process_command(client_sock, line, username)) {
