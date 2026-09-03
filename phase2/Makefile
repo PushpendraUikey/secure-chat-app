@@ -6,7 +6,7 @@ LDFLAGS = -lcrypto
 
 UTILS = ./dh.cpp ./crypto_utils.cpp ./aes_gcm.cpp ./base64.cpp
 
-all: server client
+all: server client mitm
 
 server: server.cpp protocol.h $(UTILS)
 	$(CXX) $(CXXFLAGS) server.cpp $(UTILS) -o server $(LDFLAGS)
@@ -14,5 +14,8 @@ server: server.cpp protocol.h $(UTILS)
 client: client.cpp protocol.h $(UTILS)
 	$(CXX) $(CXXFLAGS) client.cpp $(UTILS) -o client $(LDFLAGS)
 
+mitm: mitm.cpp protocol.h $(UTILS)
+	$(CXX) $(CXXFLAGS) mitm.cpp $(UTILS) -o mitm $(LDFLAGS)
+
 clean:
-	rm -f server client
+	rm -f server client mitm
