@@ -1,4 +1,6 @@
 #include "protocol.h"
+#include "dh.h"
+#include "crypto_utils.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -10,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <array>
 
 bool send_all(int sock, const std::string& data) {
     size_t total_sent = 0;
@@ -133,6 +136,39 @@ void print_help() {
     std::cout << "\nAny other text is sent to the selected user.\n\n";
 }
 
+bool perform_dh_handshake(int sock, std::array<unsigned char, AES_KEY_SIZE>& session_key) {
+    DiffieHellman dh;
+    dh.generate_keypair();
+    
+    if (!send_line(sock, "DH_INIT " + dh.get_public_value_hex())) {
+        return false;
+    }
+
+    char buffer[BUFFER_SIZE];
+    std::string pending;
+    
+    while (true) {
+        ssize_t bytes = recv(sock, buffer, sizeof(buffer), 0);
+        if (bytes <= 0) return false;
+        pending.append(buffer, bytes);
+        
+        size_t nl = pending.find('\n');
+        if (nl != std::string::npos) {
+            std::string line = pending.substr(0, nl);
+            if (starts_with(line, "DH_ACK ")) {
+                std::string server_pub = line.substr(7);
+                std::string shared_secret = dh.compute_shared_secret(server_pub);
+                session_key = derive_key(shared_secret);
+                
+                std::cout << "[*] Secure session established.\n";
+                std::cout << "[*] Key Fingerprint: " << fingerprint(shared_secret) << "\n";
+                return true;
+            }
+            return false; // Unexpected response
+        }
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 4) {
         std::cerr
@@ -177,6 +213,13 @@ int main(int argc, char* argv[]) {
         ) < 0) {
 
         perror("connect");
+        close(sock);
+        return 1;
+    }
+
+    std::array<unsigned char, AES_KEY_SIZE> session_key;
+    if (!perform_dh_handshake(sock, session_key)) {
+        std::cerr << "Diffie-Hellman handshake failed.\n";
         close(sock);
         return 1;
     }
