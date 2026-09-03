@@ -1,4 +1,6 @@
 #include "protocol.h"
+#include "dh.h"
+#include "crypto_utils.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -13,6 +15,7 @@
 #include <mutex>
 #include <sstream>
 #include <memory>
+#include <array>
 
 
 std::map<std::string, int> clients;
@@ -255,7 +258,51 @@ bool process_command(
     return true;
 }
 
+
+bool perform_server_handshake(int client_sock, std::array<unsigned char, AES_KEY_SIZE>& session_key) {
+    char buffer[BUFFER_SIZE];
+    std::string pending;
+    
+    while (true) {
+        ssize_t bytes = recv(client_sock, buffer, sizeof(buffer), 0);
+        if (bytes <= 0) return false;
+        pending.append(buffer, bytes);
+        
+        size_t nl = pending.find('\n');
+        if (nl != std::string::npos) {
+            std::string line = pending.substr(0, nl);
+            // In a strict pipeline we should pass leftover 'pending' data back, 
+            // but the client won't send LOGIN until it receives DH_ACK.
+            
+            if (starts_with(line, "DH_INIT ")) {
+                std::string client_pub = line.substr(8);
+                
+                DiffieHellman dh;
+                dh.generate_keypair();
+                
+                send_line_safe(client_sock, "DH_ACK " + dh.get_public_value_hex());
+                
+                std::string shared_secret = dh.compute_shared_secret(client_pub);
+                session_key = derive_key(shared_secret);
+                
+                std::cout << "[SERVER] Handshake complete for socket " << client_sock << "\n";
+                std::cout << "[SERVER] Key Fingerprint: " << fingerprint(shared_secret) << "\n";
+                return true;
+            }
+            return false;
+        }
+    }
+}
+
 void handle_client(int client_sock) {
+
+    std::array<unsigned char, AES_KEY_SIZE> session_key;
+    if (!perform_server_handshake(client_sock, session_key)) {
+        std::cerr << "[SERVER] Handshake failed for socket " << client_sock << "\n";
+        close(client_sock);
+        return;
+    }
+
     std::string username;
     std::string pending_data;
 
@@ -300,6 +347,7 @@ void handle_client(int client_sock) {
 
     remove_client(client_sock);
 }
+
 
 int main(int argc, char* argv[]) {
     int port = CHAT_PORT;
