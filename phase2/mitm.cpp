@@ -123,8 +123,9 @@ int main(int argc, char* argv[]) {
 
     // 3. Hijack Client Handshake
     char buf[BUFFER_SIZE];
-    recv(client_sock, buf, sizeof(buf), 0); // Reads client DH_INIT
-    std::string client_init(buf);
+    ssize_t n = recv(client_sock, buf, sizeof(buf), 0); // Reads client DH_INIT
+    if(n <= 0) { std::cerr << "[MITM] Failed to read client DH_INIT\n"; return 1; }
+    std::string client_init(buf, n); // length-bounded, not null-terminated
     std::string client_pub = client_init.substr(8, client_init.find('\n') - 8);
     
     DiffieHellman dh_proxy_client;
@@ -141,8 +142,9 @@ int main(int argc, char* argv[]) {
     std::string proxy_server_init = "DH_INIT " + dh_proxy_server.get_public_value_hex() + "\n";
     send_all(server_sock, proxy_server_init);
     
-    recv(server_sock, buf, sizeof(buf), 0); // Reads server DH_ACK
-    std::string server_ack(buf);
+    n = recv(server_sock, buf, sizeof(buf), 0); // Reads server DH_ACK
+    if(n <= 0) { std::cerr << "[MITM] Failed to read server DH_ACK\n"; return 1; }
+    std::string server_ack(buf, n); // length bounded
     std::string server_pub = server_ack.substr(7, server_ack.find('\n') - 7);
     
     std::string secret_server = dh_proxy_server.compute_shared_secret(server_pub);
