@@ -1,21 +1,25 @@
-CXX = c++
+CXX := g++
+CXXFLAGS := -std=c++17 -Wall -Wextra -O2
+LDFLAGS := -lcrypto -lpthread
 
-CXXFLAGS = -std=c++17 -Wall -Wextra -pthread
+COMMON_SRCS := dh.cpp crypto_utils.cpp aes_gcm.cpp base64.cpp pki.cpp handshake.cpp net_io.cpp
+COMMON_OBJS := $(COMMON_SRCS:.cpp=.o)
 
-LDFLAGS = -lcrypto
+.PHONY: all clean
 
-UTILS = ./dh.cpp ./crypto_utils.cpp ./aes_gcm.cpp ./base64.cpp
+all: server client proxy
 
-all: server client mitm
+server: server.cpp $(COMMON_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-server: server.cpp protocol.h $(UTILS)
-	$(CXX) $(CXXFLAGS) server.cpp $(UTILS) -o server $(LDFLAGS)
+client: client.cpp $(COMMON_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-client: client.cpp protocol.h $(UTILS)
-	$(CXX) $(CXXFLAGS) client.cpp $(UTILS) -o client $(LDFLAGS)
+proxy: proxy.cpp $(COMMON_OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-mitm: mitm.cpp protocol.h $(UTILS)
-	$(CXX) $(CXXFLAGS) mitm.cpp $(UTILS) -o mitm $(LDFLAGS)
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c -o $@ $
 
 clean:
-	rm -f server client mitm
+	rm -f server client proxy *.o
