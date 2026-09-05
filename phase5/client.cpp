@@ -20,21 +20,29 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <chrono>
 
 // Wire-level tag conventions
 const std::string TAG_E2E_INIT = "__E2E_INIT__";
 const std::string TAG_E2E_ACK  = "__E2E_ACK__";
 const std::string TAG_E2E_MSG  = "__E2E_MSG__";
+const std::string TAG_E2E_REKEY_INIT = "__E2E_REKEY_INIT__";
+const std::string TAG_E2E_REKEY_ACK  = "__E2E_REKEY_ACK__";
+
+struct E2ESession {
+    std::array<unsigned char, AES_KEY_SIZE> current_key;
+    std::array<unsigned char, AES_KEY_SIZE> previous_key;
+    std::chrono::steady_clock::time_point last_rotation;
+    bool has_previous = false;
+};
 
 // E2E session state, guarded by e2e_mutex throughout.
-std::map<std::string, std::array<unsigned char, AES_KEY_SIZE>> e2e_keys;
+std::map<std::string, E2ESession> e2e_sessions;
 std::map<std::string, std::shared_ptr<DiffieHellman>> pending_dh;
+std::map<std::string, std::shared_ptr<DiffieHellman>> pending_rekey_dh;
 std::mutex e2e_mutex;
 
-// Serializes writes to the server socket across the main thread and
-// the receiver thread (both can call send_secure_line concurrently —
-// e.g. main() sending a chat message while receive_messages() is
-// mid-way through replying to an incoming E2E handshake step).
+// Serializes writes to the server socket
 std::mutex send_mutex;
 
 bool send_secure_line(int sock, const std::array<unsigned char, AES_KEY_SIZE>& key, const std::string& message) {
@@ -42,6 +50,40 @@ bool send_secure_line(int sock, const std::array<unsigned char, AES_KEY_SIZE>& k
     std::string b64 = base64_encode(blob);
     std::lock_guard<std::mutex> lock(send_mutex);
     return send_line(sock, b64);
+}
+
+void e2e_timer_thread(
+    int sock,
+    const std::array<unsigned char, AES_KEY_SIZE>& server_key,
+    std::atomic<bool>& running
+) {
+    while (running) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto now = std::chrono::steady_clock::now();
+        std::string target_to_rekey;
+
+        {
+            std::lock_guard<std::mutex> lock(e2e_mutex);
+            for (auto& pair : e2e_sessions) {
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - pair.second.last_rotation).count() >= 60) {
+                    if (pending_rekey_dh.find(pair.first) == pending_rekey_dh.end()) {
+                        target_to_rekey = pair.first;
+                        break; 
+                    }
+                }
+            }
+        }
+
+        if (!target_to_rekey.empty()) {
+            auto dh = std::make_shared<DiffieHellman>();
+            dh->generate_keypair();
+            {
+                std::lock_guard<std::mutex> lock(e2e_mutex);
+                pending_rekey_dh[target_to_rekey] = dh;
+            }
+            send_secure_line(sock, server_key, "MSG " + target_to_rekey + " " + TAG_E2E_REKEY_INIT + dh->get_public_value_hex());
+        }
+    }
 }
 
 void send_chat_message(
@@ -56,9 +98,9 @@ void send_chat_message(
 
     {
         std::lock_guard<std::mutex> lock(e2e_mutex);
-        auto it = e2e_keys.find(target);
-        if (it != e2e_keys.end()) {
-            peer_key = it->second;
+        auto it = e2e_sessions.find(target);
+        if (it != e2e_sessions.end()) {
+            peer_key = it->second.current_key;
             has_e2e = true;
         } else if (pending_dh.count(target)) {
             is_pending = true;
@@ -75,8 +117,7 @@ void send_chat_message(
     if (is_pending) {
         std::cout << "[*] E2E handshake with " << target
                   << " still in progress — this message is going through "
-                     "the outer client-server tunnel only (visible to the "
-                     "server), not yet end-to-end encrypted.\n";
+                     "the outer client-server tunnel only.\n";
     }
 
     send_secure_line(sock, server_key, "MSG " + target + " " + text);
@@ -89,14 +130,12 @@ void initiate_e2e(
 ) {
     {
         std::lock_guard<std::mutex> lock(e2e_mutex);
-        if (e2e_keys.count(target)) {
-            std::cout << "[*] Already have an established E2E session with "
-                      << target << " — not re-initiating.\n";
+        if (e2e_sessions.count(target)) {
+            std::cout << "[*] Already have an established E2E session with " << target << ".\n";
             return;
         }
         if (pending_dh.count(target)) {
-            std::cout << "[*] E2E handshake with " << target
-                      << " is already in progress — not sending a second request.\n";
+            std::cout << "[*] E2E handshake with " << target << " is already in progress.\n";
             return;
         }
     }
@@ -107,14 +146,7 @@ void initiate_e2e(
 
     {
         std::lock_guard<std::mutex> lock(e2e_mutex);
-        // Re-check under lock in case a peer's INIT for this same target
-        // arrived and got processed between our check above and now —
-        // extremely unlikely given how fast this runs, but cheap to guard.
-        if (pending_dh.count(target) || e2e_keys.count(target)) {
-            std::cout << "[*] E2E session with " << target
-                      << " was just established/started concurrently — not sending.\n";
-            return;
-        }
+        if (pending_dh.count(target) || e2e_sessions.count(target)) return;
         pending_dh[target] = dh;
     }
 
@@ -125,13 +157,13 @@ void initiate_e2e(
 void handle_incoming_message(
     int sock,
     const std::array<unsigned char, AES_KEY_SIZE>& server_key,
+    const std::string& current_username,
     const std::string& sender,
     const std::string& payload
 ) {
     // --- 1. Handshake initiation from peer ---
     if (starts_with(payload, TAG_E2E_INIT)) {
         std::string peer_pub_hex = payload.substr(TAG_E2E_INIT.size());
-
         std::shared_ptr<DiffieHellman> dh;
         bool reusing_existing = false;
 
@@ -139,22 +171,9 @@ void handle_incoming_message(
             std::lock_guard<std::mutex> lock(e2e_mutex);
             auto it = pending_dh.find(sender);
             if (it != pending_dh.end()) {
-                // SIMULTANEOUS-INITIATION CASE: we also started a
-                // handshake with this exact peer before their INIT
-                // arrived. Reuse OUR already-generated keypair rather
-                // than manufacturing a second one — DH's shared secret
-                // is symmetric (peer_pub^our_priv == our_pub^peer_priv
-                // mod p), so both sides converge on the identical key
-                // as long as each side commits to a single keypair per
-                // peer, with no extra coordination or tie-break needed.
                 dh = it->second;
                 reusing_existing = true;
             } else {
-                // Normal case, OR peer is re-initiating a session we
-                // already consider established (e.g. their client
-                // restarted and lost state). We honor it as a rekey —
-                // documented simplification for Phase 4; fully
-                // atomic, collision-free rekeying is Phase 5's job.
                 dh = std::make_shared<DiffieHellman>();
                 dh->generate_keypair();
             }
@@ -167,18 +186,12 @@ void handle_incoming_message(
 
             {
                 std::lock_guard<std::mutex> lock(e2e_mutex);
-                e2e_keys[sender] = key;
-                if (reusing_existing) {
-                    pending_dh.erase(sender); // consumed by this path now
-                }
+                e2e_sessions[sender] = {key, {}, std::chrono::steady_clock::now(), false};
+                if (reusing_existing) pending_dh.erase(sender);
             }
 
             std::cout << "\n[*] End-to-End session established with " << sender << "\n";
             std::cout << "[*] E2E Key Fingerprint: " << fingerprint(shared_secret) << "\n> " << std::flush;
-
-            // Reply with an ACK carrying our public value — the peer's
-            // ACK-handler treats this as a normal completion, or (if
-            // they also hit the reuse path) as a harmless duplicate.
             send_secure_line(sock, server_key, "MSG " + sender + " " + TAG_E2E_ACK + our_pub_hex);
         } catch (const std::exception& e) {
             std::cout << "\n[!] Failed to complete E2E INIT from " << sender << ": " << e.what() << "\n> " << std::flush;
@@ -187,7 +200,6 @@ void handle_incoming_message(
     // --- 2. Handshake acknowledgment from peer ---
     else if (starts_with(payload, TAG_E2E_ACK)) {
         std::string peer_pub_hex = payload.substr(TAG_E2E_ACK.size());
-
         std::shared_ptr<DiffieHellman> dh;
         bool already_established = false;
 
@@ -197,24 +209,13 @@ void handle_incoming_message(
             if (it != pending_dh.end()) {
                 dh = it->second;
                 pending_dh.erase(it);
-            } else if (e2e_keys.count(sender)) {
-                // A duplicate/redundant ACK — most likely the tail end
-                // of a simultaneous-initiation race that already
-                // resolved via the INIT-reuse path above. Not an error.
+            } else if (e2e_sessions.count(sender)) {
                 already_established = true;
             }
         }
 
-        if (already_established) {
-            // Quiet — this is expected traffic in the race scenario,
-            return;
-        }
-
-        if (!dh) {
-            std::cout << "\n[!] Received unexpected E2E ACK from " << sender
-                      << " (no handshake was pending) — ignoring.\n> " << std::flush;
-            return;
-        }
+        if (already_established) return;
+        if (!dh) return;
 
         try {
             std::string shared_secret = dh->compute_shared_secret(peer_pub_hex);
@@ -222,7 +223,7 @@ void handle_incoming_message(
 
             {
                 std::lock_guard<std::mutex> lock(e2e_mutex);
-                e2e_keys[sender] = key;
+                e2e_sessions[sender] = {key, {}, std::chrono::steady_clock::now(), false};
             }
 
             std::cout << "\n[*] End-to-End session established with " << sender << "\n";
@@ -231,17 +232,85 @@ void handle_incoming_message(
             std::cout << "\n[!] Failed to complete E2E ACK from " << sender << ": " << e.what() << "\n> " << std::flush;
         }
     }
-    // --- 3. Inner-layer encrypted chat message ---
+    // --- 3. Rekey initiation from peer ---
+    else if (starts_with(payload, TAG_E2E_REKEY_INIT)) {
+        std::string peer_pub_hex = payload.substr(TAG_E2E_REKEY_INIT.size());
+        {
+            std::lock_guard<std::mutex> lock(e2e_mutex);
+            if (pending_rekey_dh.count(sender)) {
+                // Collision Tie-Breaker
+                if (current_username < sender) return;
+                pending_rekey_dh.erase(sender);
+            }
+        }
+
+        try {
+            DiffieHellman dh;
+            dh.generate_keypair();
+            std::string shared_secret = dh.compute_shared_secret(peer_pub_hex);
+            auto new_key = derive_key(shared_secret);
+
+            {
+                std::lock_guard<std::mutex> lock(e2e_mutex);
+                auto& session = e2e_sessions[sender];
+                session.previous_key = session.current_key;
+                session.has_previous = true;
+                session.current_key = new_key;
+                session.last_rotation = std::chrono::steady_clock::now();
+            }
+
+            std::cout << "\n[*] Session Key Rotated with " << sender << ". New Fingerprint: " << fingerprint(shared_secret) << "\n> " << std::flush;
+            send_secure_line(sock, server_key, "MSG " + sender + " " + TAG_E2E_REKEY_ACK + dh.get_public_value_hex());
+        } catch (const std::exception& e) {
+            std::cout << "\n[!] Failed to complete REKEY INIT from " << sender << ": " << e.what() << "\n> " << std::flush;
+        }
+    }
+    // --- 4. Rekey acknowledgment from peer ---
+    else if (starts_with(payload, TAG_E2E_REKEY_ACK)) {
+        std::string peer_pub_hex = payload.substr(TAG_E2E_REKEY_ACK.size());
+        std::shared_ptr<DiffieHellman> dh;
+        {
+            std::lock_guard<std::mutex> lock(e2e_mutex);
+            auto it = pending_rekey_dh.find(sender);
+            if (it != pending_rekey_dh.end()) {
+                dh = it->second;
+                pending_rekey_dh.erase(it);
+            }
+        }
+
+        if (!dh) return;
+
+        try {
+            std::string shared_secret = dh->compute_shared_secret(peer_pub_hex);
+            auto new_key = derive_key(shared_secret);
+
+            {
+                std::lock_guard<std::mutex> lock(e2e_mutex);
+                auto& session = e2e_sessions[sender];
+                session.previous_key = session.current_key;
+                session.has_previous = true;
+                session.current_key = new_key;
+                session.last_rotation = std::chrono::steady_clock::now();
+            }
+
+            std::cout << "\n[*] Session Key Rotated with " << sender << ". New Fingerprint: " << fingerprint(shared_secret) << "\n> " << std::flush;
+        } catch (const std::exception& e) {
+            std::cout << "\n[!] Failed to complete REKEY ACK from " << sender << ": " << e.what() << "\n> " << std::flush;
+        }
+    }
+    // --- 5. Inner-layer encrypted chat message ---
     else if (starts_with(payload, TAG_E2E_MSG)) {
         std::string inner_b64 = payload.substr(TAG_E2E_MSG.size());
-        std::array<unsigned char, AES_KEY_SIZE> peer_key;
-        bool has_key = false;
+        std::array<unsigned char, AES_KEY_SIZE> curr_key, prev_key;
+        bool has_key = false, has_prev = false;
 
         {
             std::lock_guard<std::mutex> lock(e2e_mutex);
-            auto it = e2e_keys.find(sender);
-            if (it != e2e_keys.end()) {
-                peer_key = it->second;
+            auto it = e2e_sessions.find(sender);
+            if (it != e2e_sessions.end()) {
+                curr_key = it->second.current_key;
+                prev_key = it->second.previous_key;
+                has_prev = it->second.has_previous;
                 has_key = true;
             }
         }
@@ -254,13 +323,18 @@ void handle_incoming_message(
 
         try {
             std::string inner_blob = base64_decode(inner_b64);
-            std::string plaintext = decrypt_message(peer_key, inner_blob);
+            std::string plaintext;
+            try {
+                plaintext = decrypt_message(curr_key, inner_blob);
+            } catch (...) {
+                if (has_prev) plaintext = decrypt_message(prev_key, inner_blob);
+                else throw;
+            }
             std::cout << "\n[" << sender << " (E2E)] " << plaintext << "\n> " << std::flush;
         } catch (const std::exception& e) {
             std::cout << "\n[CRYPTO ERROR] E2E Decryption/Tamper failure from " << sender << ": " << e.what() << "\n> " << std::flush;
         }
     }
-    // --- 4. Plain message (pre-E2E, or a peer choosing not to use E2E) ---
     else {
         std::cout << "\n[" << sender << "] " << payload << "\n> " << std::flush;
     }
@@ -270,6 +344,7 @@ void receive_messages(
     int sock,
     std::string pending,
     const std::array<unsigned char, AES_KEY_SIZE>& server_key,
+    const std::string& current_username,
     std::atomic<bool>& running
 ) {
     while (running) {
@@ -295,7 +370,7 @@ void receive_messages(
             if (space != std::string::npos) {
                 std::string sender = rest.substr(0, space);
                 std::string payload = rest.substr(space + 1);
-                handle_incoming_message(sock, server_key, sender, payload);
+                handle_incoming_message(sock, server_key, current_username, sender, payload);
             }
         } else if (starts_with(line, "USERS")) {
             std::cout << "\nOnline users: " << line.substr(5) << "\n> " << std::flush;
@@ -358,7 +433,8 @@ int main(int argc, char* argv[]) {
     send_secure_line(sock, session_key, "LOGIN " + username);
 
     std::atomic<bool> running(true);
-    std::thread receiver(receive_messages, sock, std::move(pending), std::ref(session_key), std::ref(running));
+    std::thread receiver(receive_messages, sock, std::move(pending), std::ref(session_key), username, std::ref(running));
+    std::thread timer(e2e_timer_thread, sock, std::ref(session_key), std::ref(running));
 
     std::string selected_user;
     std::cout << "Connected as: " << username << std::endl;
@@ -405,5 +481,6 @@ int main(int argc, char* argv[]) {
     shutdown(sock, SHUT_RDWR);
     close(sock);
     if (receiver.joinable()) receiver.join();
+    if (timer.joinable()) timer.join();
     return 0;
 }
