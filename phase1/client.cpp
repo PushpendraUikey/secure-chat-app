@@ -13,7 +13,6 @@
 
 bool send_all(int sock, const std::string& data) {
     size_t total_sent = 0;
-
     while (total_sent < data.size()) {
         ssize_t sent = send(
             sock,
@@ -21,11 +20,9 @@ bool send_all(int sock, const std::string& data) {
             data.size() - total_sent,
             0
         );
-
         if (sent <= 0) {
             return false;
         }
-
         total_sent += static_cast<size_t>(sent);
     }
 
@@ -36,26 +33,15 @@ bool send_line(int sock, const std::string& message) {
     return send_all(sock, message + "\n");
 }
 
-void receive_messages(
-    int sock,
-    std::atomic<bool>& running
-) {
+void receive_messages(int sock, std::atomic<bool>& running) {
     std::string pending_data;
-
     char buffer[BUFFER_SIZE];
 
     while (running) {
-        ssize_t bytes_received = recv(
-            sock,
-            buffer,
-            sizeof(buffer),
-            0
-        );
+        ssize_t bytes_received = recv(sock, buffer, sizeof(buffer), 0);
 
         if (bytes_received <= 0) {
-            std::cout
-                << "\n[Disconnected from server]\n";
-
+            std::cout << "\n[Disconnected from server]\n";
             running = false;
             break;
         }
@@ -64,27 +50,20 @@ void receive_messages(
 
         while (true) {
             size_t newline = pending_data.find('\n');
-
             if (newline == std::string::npos) {
                 break;
             }
 
-            std::string line =
-                pending_data.substr(0, newline);
-
+            std::string line = pending_data.substr(0, newline);
             pending_data.erase(0, newline + 1);
 
             if (starts_with(line, "FROM ")) {
                 std::string rest = line.substr(5);
-
                 size_t space = rest.find(' ');
 
                 if (space != std::string::npos) {
-                    std::string sender =
-                        rest.substr(0, space);
-
-                    std::string message =
-                        rest.substr(space + 1);
+                    std::string sender = rest.substr(0, space);
+                    std::string message =rest.substr(space + 1);
 
                     std::cout
                         << "\n[" << sender << "] "
@@ -135,11 +114,7 @@ void print_help() {
 
 int main(int argc, char* argv[]) {
     if (argc != 4) {
-        std::cerr
-            << "Usage: "
-            << argv[0]
-            << " <server_ip> <port> <username>\n";
-
+        std::cerr << "Usage: " << argv[0] << " <server_ip> <port> <username>\n";
         return 1;
     }
 
@@ -159,23 +134,13 @@ int main(int argc, char* argv[]) {
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
 
-    if (inet_pton(
-            AF_INET,
-            server_ip.c_str(),
-            &server_addr.sin_addr
-        ) <= 0) {
-
+    if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) <= 0) {
         std::cerr << "Invalid server IP\n";
         close(sock);
         return 1;
     }
 
-    if (connect(
-            sock,
-            reinterpret_cast<sockaddr*>(&server_addr),
-            sizeof(server_addr)
-        ) < 0) {
-
+    if (connect(sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
         perror("connect");
         close(sock);
         return 1;
@@ -197,16 +162,12 @@ int main(int argc, char* argv[]) {
 
     std::string selected_user;
 
-    std::cout
-        << "Connected as: "
-        << username
-        << std::endl;
+    std::cout << "Connected as: " << username << std::endl;
 
     print_help();
 
     while (running) {
         std::cout << "> ";
-
         std::string input;
 
         if (!std::getline(std::cin, input)) {
@@ -231,9 +192,7 @@ int main(int argc, char* argv[]) {
             std::string target = input.substr(6);
 
             if (target.empty()) {
-                std::cout
-                    << "Usage: /chat username\n";
-
+                std::cout << "Usage: /chat username\n";
                 continue;
             }
 
@@ -249,31 +208,20 @@ int main(int argc, char* argv[]) {
             size_t space = input.find(' ');
 
             if (space == std::string::npos) {
-                std::cout
-                    << "Usage: @username message\n";
-
+                std::cout << "Usage: @username message\n";
                 continue;
             }
 
-            std::string target =
-                input.substr(1, space - 1);
-
-            std::string message =
-                input.substr(space + 1);
+            std::string target = input.substr(1, space - 1);
+            std::string message = input.substr(space + 1);
 
             if (target.empty() || message.empty()) {
-                std::cout
-                    << "Usage: @username message\n";
-
+                std::cout << "Usage: @username message\n";
                 continue;
             }
 
             selected_user = target;
-
-            send_line(
-                sock,
-                "MSG " + selected_user + " " + message
-            );
+            send_line(sock, "MSG " + selected_user + " " + message);
         }
 
         else {
@@ -286,10 +234,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            send_line(
-                sock,
-                "MSG " + selected_user + " " + input
-            );
+            send_line(sock, "MSG " + selected_user + " " + input);
         }
     }
 

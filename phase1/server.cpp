@@ -20,9 +20,10 @@ std::mutex clients_mutex;
 
 // one write-mutex per connected socket, to serialize all writes to that fd
 std::map<int, std::shared_ptr<std::mutex>> client_write_mutexes;
+std::mutex client_write_mutexes_mutex;
 
 std::string get_username_by_socket(int sock) {
-    std::lock_guard<std::mutex> lock(clients_mutex);
+    std::lock_guard<std::mutex> clg(clients_mutex);
 
     for (const auto& pair : clients) {
         if (pair.second == sock) {
@@ -59,7 +60,7 @@ void send_line(int sock, const std::string& message) {
 }
 
 std::shared_ptr<std::mutex> get_write_mutex(int sock) {
-    std::lock_guard<std::mutex> lock(clients_mutex);
+    std::lock_guard<std::mutex> wlg(client_write_mutexes_mutex);
     auto it = client_write_mutexes.find(sock);
     return (it != client_write_mutexes.end()) ? it->second : nullptr;
 }
@@ -67,7 +68,7 @@ std::shared_ptr<std::mutex> get_write_mutex(int sock) {
 void send_line_safe(int sock, const std::string& message) {
     auto mtx = get_write_mutex(sock);
     if (mtx) {
-        std::lock_guard<std::mutex> lock(*mtx);
+        std::lock_guard<std::mutex> slg(*mtx);
         send_line(sock, message);
     } else {
         // Not yet registered (e.g. pre-LOGIN) — no contention possible yet
@@ -79,7 +80,7 @@ void remove_client(int sock) {
     std::shared_ptr<std::mutex> write_mtx;
 
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::lock_guard<std::mutex> clg(clients_mutex);
 
         for (auto it = clients.begin(); it != clients.end(); ++it) {
             if (it->second == sock) {
@@ -90,6 +91,7 @@ void remove_client(int sock) {
             }
         }
 
+        std::lock_guard<std::mutex> wlg(client_write_mutexes_mutex);
         auto it2 = client_write_mutexes.find(sock);
         if (it2 != client_write_mutexes.end()) {
             write_mtx = it2->second;
@@ -98,7 +100,7 @@ void remove_client(int sock) {
     }
 
     if (write_mtx) {
-        std::lock_guard<std::mutex> lock(*write_mtx);
+        std::lock_guard<std::mutex> slg(*write_mtx);
         close(sock);
     } else {
         close(sock);
@@ -110,7 +112,7 @@ void handle_who(int sock) {
     response << "USERS";
 
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::lock_guard<std::mutex> clg(clients_mutex);
 
         for (const auto& pair : clients) {
             response << " " << pair.first;
@@ -135,10 +137,8 @@ void handle_message(
     int recipient_sock = -1;
 
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
-
+        std::lock_guard<std::mutex> clg(clients_mutex);
         auto it = clients.find(recipient);
-
         if (it != clients.end()) {
             recipient_sock = it->second;
         }
@@ -187,15 +187,14 @@ bool process_command(
         }
 
         {
-            std::lock_guard<std::mutex> lock(clients_mutex);
-
+            std::lock_guard<std::mutex> clg(clients_mutex);
             if (clients.count(requested_name)) {
                 send_line_safe(sock, "ERR Username already in use");
                 return true;
             }
-
             clients[requested_name] = sock;
-        
+            
+            std::lock_guard<std::mutex> wlg(client_write_mutexes_mutex);
             client_write_mutexes[sock] = std::make_shared<std::mutex>(); 
         }
 
@@ -225,10 +224,7 @@ bool process_command(
         size_t space = rest.find(' ');
 
         if (space == std::string::npos) {
-            send_line_safe(
-                sock,
-                "ERR Usage: MSG <username> <message>"
-            );
+            send_line_safe(sock, "ERR Usage: MSG <username> <message>");
             return true;
         }
 
@@ -262,36 +258,23 @@ void handle_client(int client_sock) {
     char buffer[BUFFER_SIZE];
 
     while (true) {
-        ssize_t bytes_received = recv(
-            client_sock,
-            buffer,
-            sizeof(buffer),
-            0
-        );
+        ssize_t bytes_received = recv(client_sock, buffer, sizeof(buffer), 0);
 
         if (bytes_received <= 0) {
             break;
         }
-
         pending_data.append(buffer, bytes_received);
 
         while (true) {
             size_t newline = pending_data.find('\n');
-
             if (newline == std::string::npos) {
                 break;
             }
 
-            std::string line =
-                pending_data.substr(0, newline);
-
+            std::string line = pending_data.substr(0, newline);
             pending_data.erase(0, newline + 1);
 
-            if (!process_command(
-                    client_sock,
-                    line,
-                    username
-                )) {
+            if (!process_command(client_sock, line, username)) {
                 remove_client(client_sock);
                 return;
             }
@@ -317,13 +300,7 @@ int main(int argc, char* argv[]) {
 
     int opt = 1;
 
-    setsockopt(
-        server_sock,
-        SOL_SOCKET,
-        SO_REUSEADDR,
-        &opt,
-        sizeof(opt)
-    );
+    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in server_addr{};
 
@@ -331,12 +308,7 @@ int main(int argc, char* argv[]) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
 
-    if (bind(
-            server_sock,
-            reinterpret_cast<sockaddr*>(&server_addr),
-            sizeof(server_addr)
-        ) < 0) {
-
+    if (bind(server_sock, reinterpret_cast<sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
         perror("bind");
         close(server_sock);
         return 1;
@@ -358,11 +330,7 @@ int main(int argc, char* argv[]) {
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
 
-        int client_sock = accept(
-            server_sock,
-            reinterpret_cast<sockaddr*>(&client_addr),
-            &client_len
-        );
+        int client_sock = accept(server_sock, reinterpret_cast<sockaddr*>(&client_addr), &client_len);
 
         if (client_sock < 0) {
             perror("accept");
@@ -373,10 +341,7 @@ int main(int argc, char* argv[]) {
                   << inet_ntoa(client_addr.sin_addr)
                   << std::endl;
 
-        std::thread(
-            handle_client,
-            client_sock
-        ).detach();
+        std::thread(handle_client, client_sock).detach();
     }
 
     close(server_sock);
