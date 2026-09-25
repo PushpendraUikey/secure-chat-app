@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <csignal>
 
 #include <cerrno>
 #include <iostream>
@@ -285,6 +286,7 @@ void handle_client(int client_sock) {
 }
 
 int main(int argc, char* argv[]) {
+    signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on write to closed sockets
     int port = CHAT_PORT;
 
     if (argc == 2) {
@@ -337,8 +339,10 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         std::cout << "[SERVER] New TCP connection from "
-                  << inet_ntoa(client_addr.sin_addr)
+                  << client_ip
                   << std::endl;
 
         std::thread(handle_client, client_sock).detach();
