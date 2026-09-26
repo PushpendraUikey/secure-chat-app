@@ -4,6 +4,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <poll.h>
+#include <csignal>
 
 #include <atomic>
 #include <iostream>
@@ -33,76 +35,6 @@ bool send_line(int sock, const std::string& message) {
     return send_all(sock, message + "\n");
 }
 
-void receive_messages(int sock, std::atomic<bool>& running) {
-    std::string pending_data;
-    char buffer[BUFFER_SIZE];
-
-    while (running) {
-        ssize_t bytes_received = recv(sock, buffer, sizeof(buffer), 0);
-
-        if (bytes_received <= 0) {
-            std::cout << "\n[Disconnected from server]\n";
-            running = false;
-            break;
-        }
-
-        pending_data.append(buffer, bytes_received);
-
-        while (true) {
-            size_t newline = pending_data.find('\n');
-            if (newline == std::string::npos) {
-                break;
-            }
-
-            std::string line = pending_data.substr(0, newline);
-            pending_data.erase(0, newline + 1);
-
-            if (starts_with(line, "FROM ")) {
-                std::string rest = line.substr(5);
-                size_t space = rest.find(' ');
-
-                if (space != std::string::npos) {
-                    std::string sender = rest.substr(0, space);
-                    std::string message =rest.substr(space + 1);
-
-                    std::cout
-                        << "\n[" << sender << "] "
-                        << message << "\n> "
-                        << std::flush;
-                }
-            }
-            else if (starts_with(line, "USERS")) {
-                std::cout
-                    << "\nOnline users: "
-                    << line.substr(5)
-                    << "\n> "
-                    << std::flush;
-            }
-            else if (starts_with(line, "ERR ")) {
-                std::cout
-                    << "\n[ERROR] "
-                    << line.substr(4)
-                    << "\n> "
-                    << std::flush;
-            }
-            else if (starts_with(line, "OK ")) {
-                std::cout
-                    << "\n[SERVER] "
-                    << line.substr(3)
-                    << "\n> "
-                    << std::flush;
-            }
-            else {
-                std::cout
-                    << "\n[SERVER] "
-                    << line
-                    << "\n> "
-                    << std::flush;
-            }
-        }
-    }
-}
-
 void print_help() {
     std::cout << "\nCommands:\n";
     std::cout << "  @username message  Send message and select user\n";
@@ -117,6 +49,8 @@ int main(int argc, char* argv[]) {
         std::cerr << "Usage: " << argv[0] << " <server_ip> <port> <username>\n";
         return 1;
     }
+
+    signal(SIGPIPE, SIG_IGN); // Ignore SIGPIPE to prevent crashes on write to closed sockets
 
     std::string server_ip = argv[1];
     int port = std::stoi(argv[2]);
@@ -152,99 +86,161 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::atomic<bool> running(true);
-
-    std::thread receiver(
-        receive_messages,
-        sock,
-        std::ref(running)
-    );
+    std::cout << "Connected as: " << username << std::endl;
+    print_help();
+    std::cout << "> " << std::flush;
 
     std::string selected_user;
+    std::string pending_sock_data;
+    std::string pending_stdin_data;
 
-    std::cout << "Connected as: " << username << std::endl;
+    struct pollfd fds[2];
+    fds[0].fd = STDIN_FILENO;
+    fds[0].events = POLLIN;
+    fds[1].fd = sock;
+    fds[1].events = POLLIN;
 
-    print_help();
-
+    bool running = true;
     while (running) {
-        std::cout << "> ";
-        std::string input;
-
-        if (!std::getline(std::cin, input)) {
+        int ret = poll(fds, 2, -1); // block indefinitely until one FD is ready
+        if( ret < 0 ) {
+            perror("poll");
             break;
         }
 
-        if (input.empty()) {
-            continue;
-        }
+        // 1. Handle incoming SERVER data
+        if( fds[1].revents & (POLLIN | POLLERR | POLLHUP) ) {
+            char buffer[BUFFER_SIZE];
+            ssize_t bytes_received = recv(sock, buffer, sizeof(buffer), 0);
 
-        if (input == "/who") {
-            send_line(sock, "WHO");
-        }
-
-        else if (input == "/quit") {
-            send_line(sock, "QUIT");
-            running = false;
-            break;
-        }
-
-        else if (starts_with(input, "/chat ")) {
-            std::string target = input.substr(6);
-
-            if (target.empty()) {
-                std::cout << "Usage: /chat username\n";
-                continue;
+            if( bytes_received <= 0 ) {
+                std::cerr << "\n[Disconnected from server]\n";
+                running = false;
+                break;
             }
 
-            selected_user = target;
+            pending_sock_data.append(buffer, bytes_received);
 
-            std::cout
-                << "Now chatting with: "
-                << selected_user
-                << std::endl;
+            while(true) {
+                size_t newline = pending_sock_data.find('\n');
+                if( newline == std::string::npos )  break;
+
+                std::string line = pending_sock_data.substr(0, newline);
+                pending_sock_data.erase(0, newline + 1);
+
+                // Clean up carriage return from telnet/netcat testing
+                if(!line.empty() && line.back() == '\r') line.pop_back();
+
+                if (starts_with(line, "FROM ")) {
+                    std::string rest = line.substr(5);
+                    size_t space = rest.find(' ');
+
+                    if (space != std::string::npos) {
+                        std::string sender = rest.substr(0, space);
+                        std::string message =rest.substr(space + 1);
+
+                        std::cout << "\n[" << sender << "] " << message << "\n> " << std::flush;
+                    }
+                }
+                else if (starts_with(line, "USERS")) {
+                    std::cout << "\nOnline users: " << line.substr(5) << "\n> " << std::flush;
+                }
+                else if (starts_with(line, "ERR ")) {
+                    std::cout << "\n[ERROR] " << line.substr(4) << "\n> " << std::flush;
+                }
+                else if (starts_with(line, "OK ")) {
+                    std::cout << "\n[SERVER] " << line.substr(3) << "\n> " << std::flush;
+                }
+                else {
+                    std::cout << "\n[SERVER] " << line << "\n> " << std::flush;
+                }
+            }
         }
 
-        else if (input[0] == '@') {
-            size_t space = input.find(' ');
+        // 2. Handle user KEYBOARD input
+        if( fds[0].revents & POLLIN) {
+            char buffer[BUFFER_SIZE];
+            ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer));
 
-            if (space == std::string::npos) {
-                std::cout << "Usage: @username message\n";
-                continue;
+            if( bytes_read <= 0 ) break;    // EOF on stdin
+
+            pending_stdin_data.append(buffer, bytes_read);
+
+            while(true) {
+                size_t newline = pending_stdin_data.find('\n');
+                if( newline == std::string::npos ) break;
+
+                std::string input = pending_stdin_data.substr(0, newline);
+                pending_stdin_data.erase(0, newline + 1);
+
+                if(input.empty()) {
+                    std::cout << "> " << std::flush;
+                    continue;
+                }
+                
+                if (input == "/who") {
+                    send_line(sock, "WHO");
+                }
+
+                else if (input == "/quit") {
+                    send_line(sock, "QUIT");
+                    running = false;
+                    break;
+                }
+
+                else if (starts_with(input, "/chat ")) {
+                    std::string target = input.substr(6);
+
+                    if (target.empty()) {
+                        std::cout << "Usage: /chat username\n";
+                        continue;
+                    }
+
+                    selected_user = target;
+
+                    std::cout
+                        << "Now chatting with: "
+                        << selected_user
+                        << std::endl;
+                }
+
+                else if (input[0] == '@') {
+                    size_t space = input.find(' ');
+
+                    if (space == std::string::npos) {
+                        std::cout << "Usage: @username message\n";
+                        continue;
+                    }
+
+                    std::string target = input.substr(1, space - 1);
+                    std::string message = input.substr(space + 1);
+
+                    if (target.empty() || message.empty()) {
+                        std::cout << "Usage: @username message\n";
+                        continue;
+                    }
+
+                    selected_user = target;
+                    send_line(sock, "MSG " + selected_user + " " + message);
+                }
+
+                else {
+                    if (selected_user.empty()) {
+                        std::cout
+                            << "No chat partner selected.\n"
+                            << "Use /chat username or "
+                            << "@username message\n";
+                        continue;
+                    }
+
+                    send_line(sock, "MSG " + selected_user + " " + input);
+                }
             }
-
-            std::string target = input.substr(1, space - 1);
-            std::string message = input.substr(space + 1);
-
-            if (target.empty() || message.empty()) {
-                std::cout << "Usage: @username message\n";
-                continue;
-            }
-
-            selected_user = target;
-            send_line(sock, "MSG " + selected_user + " " + message);
-        }
-
-        else {
-            if (selected_user.empty()) {
-                std::cout
-                    << "No chat partner selected.\n"
-                    << "Use /chat username or "
-                    << "@username message\n";
-
-                continue;
-            }
-
-            send_line(sock, "MSG " + selected_user + " " + input);
-        }
+        }  
     }
 
     shutdown(sock, SHUT_RDWR);
-
     close(sock);
-
-    if (receiver.joinable()) {
-        receiver.join();
-    }
 
     return 0;
 }

@@ -275,6 +275,8 @@ void handle_client(int client_sock) {
             std::string line = pending_data.substr(0, newline);
             pending_data.erase(0, newline + 1);
 
+            if(!line.empty() && line.back() == '\r') line.pop_back();
+
             if (!process_command(client_sock, line, username)) {
                 remove_client(client_sock);
                 return;
