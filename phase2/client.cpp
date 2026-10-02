@@ -38,64 +38,6 @@ bool send_secure_line(int sock, const std::array<unsigned char, AES_KEY_SIZE>& k
     return send_line(sock, b64);
 }
 
-void receive_messages(
-    int sock,
-    const std::array<unsigned char, AES_KEY_SIZE>& key,
-    std::atomic<bool>& running
-) {
-    std::string pending_data;
-    char buffer[BUFFER_SIZE];
-
-    while (running) {
-        ssize_t bytes_received = recv(sock, buffer, sizeof(buffer), 0);
-        if (bytes_received <= 0) {
-            std::cout << "\n[Disconnected from server]\n";
-            running = false;
-            break;
-        }
-
-        pending_data.append(buffer, bytes_received);
-
-        while (true) {
-            size_t newline = pending_data.find('\n');
-            if (newline == std::string::npos) break;
-
-            std::string raw_line = pending_data.substr(0, newline);
-            pending_data.erase(0, newline + 1);
-
-            std::string line;
-            try {
-                line = decrypt_message(key, base64_decode(raw_line));
-            } catch (const std::exception& e) {
-                std::cout << "\n[CRYPTO ERROR] Tampering detected: " << e.what() << "\n> " << std::flush;
-                running = false;
-                break;
-            }
-
-            if (starts_with(line, "FROM ")) {
-                std::string rest = line.substr(5);
-                size_t space = rest.find(' ');
-                if (space != std::string::npos) {
-                    std::cout << "\n[" << rest.substr(0, space) << "] "
-                              << rest.substr(space + 1) << "\n> " << std::flush;
-                }
-            }
-            else if (starts_with(line, "USERS")) {
-                std::cout << "\nOnline users: " << line.substr(5) << "\n> " << std::flush;
-            }
-            else if (starts_with(line, "ERR ")) {
-                std::cout << "\n[ERROR] " << line.substr(4) << "\n> " << std::flush;
-            }
-            else if (starts_with(line, "OK ")) {
-                std::cout << "\n[SERVER] " << line.substr(3) << "\n> " << std::flush;
-            }
-            else {
-                std::cout << "\n[SERVER] " << line << "\n> " << std::flush;
-            }
-        }
-    }
-}
-
 void print_help() {
     std::cout << "\nCommands:\n"
               << "  @username message  Send message and select user\n"
@@ -223,8 +165,17 @@ int main(int argc, char* argv[]) {
                 ssize_t nl = pending_sock_data.find('\n');
                 if (nl == std::string::npos) break;
 
-                std::string line = pending_sock_data.substr(0, nl);
-                pending_sock_data.erase(0, nl+1);
+                std::string raw_line = pending_sock_data.substr(0, nl);
+                pending_sock_data.erase(0, nl + 1);
+
+                std::string line;
+                try {
+                    line = decrypt_message(session_key, base64_decode(raw_line));
+                } catch (const std::exception& e) {
+                    std::cout << "\n[CRYPTO ERROR] Tampering detected: " << e.what() << "\n> " << std::flush;
+                    running = false;
+                    break;
+                }
 
                 if (!line.empty() && line.back() == '\r') line.pop_back();
 
