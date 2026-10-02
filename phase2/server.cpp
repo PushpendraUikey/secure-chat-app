@@ -21,10 +21,13 @@
 std::map<std::string, int> clients;
 std::mutex clients_mutex;
 std::map<int, std::shared_ptr<std::mutex>> client_write_mutexes;
+std::mutex client_write_mutexes_mutex;
 std::map<int, std::array<unsigned char, AES_KEY_SIZE>> client_keys;
+std::mutex client_keys_mutex;
+
 
 std::string get_username_by_socket(int sock) {
-    std::lock_guard<std::mutex> lock(clients_mutex);
+    std::lock_guard<std::mutex> clg(clients_mutex);
     for (const auto& pair : clients) {
         if (pair.second == sock) {
             return pair.first;
@@ -48,7 +51,7 @@ void send_line(int sock, const std::string& message) {
 }
 
 std::shared_ptr<std::mutex> get_write_mutex(int sock) {
-    std::lock_guard<std::mutex> lock(clients_mutex);
+    std::lock_guard<std::mutex> wlg(client_write_mutexes_mutex);
     auto it = client_write_mutexes.find(sock);
     return (it != client_write_mutexes.end()) ? it->second : nullptr;
 }
@@ -56,7 +59,7 @@ std::shared_ptr<std::mutex> get_write_mutex(int sock) {
 void send_line_safe(int sock, const std::string& message) {
     auto mtx = get_write_mutex(sock);
     if (mtx) {
-        std::lock_guard<std::mutex> lock(*mtx);
+        std::lock_guard<std::mutex> slg(*mtx);
         send_line(sock, message);
     } else {
         send_line(sock, message);
@@ -66,7 +69,7 @@ void send_line_safe(int sock, const std::string& message) {
 void send_secure_line_safe(int sock, const std::string& message) {
     std::array<unsigned char, AES_KEY_SIZE> key;
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::lock_guard<std::mutex> cklg(client_keys_mutex);
         auto it = client_keys.find(sock);
         if (it == client_keys.end()) return; 
         key = it->second;
@@ -79,7 +82,7 @@ void send_secure_line_safe(int sock, const std::string& message) {
 void remove_client(int sock) {
     std::shared_ptr<std::mutex> write_mtx;
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::scoped_lock<std::mutex, std::mutex, std::mutex> rsl(clients_mutex, client_keys_mutex, client_write_mutexes_mutex);
         for (auto it = clients.begin(); it != clients.end(); ++it) {
             if (it->second == sock) {
                 std::cout << "[SERVER] User disconnected: " << it->first << std::endl;
@@ -88,6 +91,7 @@ void remove_client(int sock) {
                 break;
             }
         }
+
         auto it2 = client_write_mutexes.find(sock);
         if (it2 != client_write_mutexes.end()) {
             write_mtx = it2->second;
@@ -95,7 +99,7 @@ void remove_client(int sock) {
         }
     }
     if (write_mtx) {
-        std::lock_guard<std::mutex> lock(*write_mtx);
+        std::lock_guard<std::mutex> slg(*write_mtx);
         close(sock);
     } else {
         close(sock);
@@ -106,7 +110,7 @@ void handle_who(int sock) {
     std::ostringstream response;
     response << "USERS";
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::lock_guard<std::mutex> clg(clients_mutex);
         for (const auto& pair : clients) {
             response << " " << pair.first;
         }
@@ -123,7 +127,7 @@ void handle_message(int sender_sock, const std::string& recipient, const std::st
 
     int recipient_sock = -1;
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::lock_guard<std::mutex> clg(clients_mutex);
         auto it = clients.find(recipient);
         if (it != clients.end()) {
             recipient_sock = it->second;
@@ -153,7 +157,7 @@ bool process_command(int sock, const std::string& line, std::string& username) {
             return true;
         }
         {
-            std::lock_guard<std::mutex> lock(clients_mutex);
+            std::scoped_lock<std::mutex, std::mutex> esl(clients_mutex, client_write_mutexes_mutex);
             if (clients.count(requested_name)) {
                 send_secure_line_safe(sock, "ERR Username already in use");
                 return true;
@@ -239,7 +243,7 @@ void handle_client(int client_sock) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(clients_mutex);
+        std::lock_guard<std::mutex> cklg(client_keys_mutex);
         client_keys[client_sock] = session_key;
     }
 
@@ -325,8 +329,9 @@ int main(int argc, char* argv[]) {
             perror("accept");
             continue;
         }
-
-        std::cout << "[SERVER] New TCP connection from " << inet_ntoa(client_addr.sin_addr) << std::endl;
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        std::cout << "[SERVER] New TCP connection from " << client_ip << std::endl;
         std::thread(handle_client, client_sock).detach();
     }
 
