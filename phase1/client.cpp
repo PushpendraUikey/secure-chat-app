@@ -193,47 +193,45 @@ int main(int argc, char* argv[]) {
 
                     if (target.empty()) {
                         std::cout << "Usage: /chat username\n";
-                        continue;
                     }
-
-                    selected_user = target;
-
-                    std::cout
-                        << "Now chatting with: "
-                        << selected_user
-                        << std::endl;
+                    else {
+                        selected_user = target;
+                        std::cout << "Now chatting with: " << selected_user << std::endl;
+                    }
                 }
 
                 else if (input[0] == '@') {
                     size_t space = input.find(' ');
-
                     if (space == std::string::npos) {
                         std::cout << "Usage: @username message\n";
-                        continue;
                     }
+                    else {
+                        std::string target = input.substr(1, space - 1);
+                        std::string message = input.substr(space + 1);
 
-                    std::string target = input.substr(1, space - 1);
-                    std::string message = input.substr(space + 1);
-
-                    if (target.empty() || message.empty()) {
-                        std::cout << "Usage: @username message\n";
-                        continue;
+                        if (target.empty() || message.empty()) {
+                            std::cout << "Usage: @username message\n";
+                        }
+                        else {
+                            selected_user = target;
+                            send_line(sock, "MSG " + selected_user + " " + message);
+                        }
                     }
-
-                    selected_user = target;
-                    send_line(sock, "MSG " + selected_user + " " + message);
                 }
-
                 else {
                     if (selected_user.empty()) {
                         std::cout
                             << "No chat partner selected.\n"
                             << "Use /chat username or "
                             << "@username message\n";
-                        continue;
                     }
+                    else {
+                        send_line(sock, "MSG " + selected_user + " " + input);
+                    }
+                }
 
-                    send_line(sock, "MSG " + selected_user + " " + input);
+                if (running) {
+                    std::cout << "> " << std::flush;
                 }
             }
         }  
