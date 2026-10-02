@@ -62,6 +62,10 @@ void send_line_safe(int sock, const std::string& message) {
         std::lock_guard<std::mutex> slg(*mtx);
         send_line(sock, message);
     } else {
+        // Currently we don't have a way to tell whether the socket belongs to the
+        // intended client, since a possibile condition exists where after 
+        // send_secure_line_safe, remove_client is called and the socket is now assigned
+        // to a new user. And below send_line will send to the new user.
         send_line(sock, message);
     }
 }
@@ -272,6 +276,8 @@ void handle_client(int client_sock) {
                 remove_client(client_sock);
                 return; // Terminate this connection entirely
             }
+
+            if (!line.empty() && line.back() == '\r') line.pop_back(); // Clean up carriage return
 
             if (!process_command(client_sock, line, username)) {
                 remove_client(client_sock);
